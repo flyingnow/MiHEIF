@@ -1,0 +1,16 @@
+{
+  "input_dir": "你的输入路径",
+  "output_dir": "你的输出路径",
+
+  "output_format": "heif",
+
+  "workers": 6,
+
+  "heif_quality": -1,
+  "png_compress_level": 9,
+
+  "recursive": false,
+  "keep_subdir_structure": false,
+
+  "overwrite": true
+}
