@@ -1,6 +1,6 @@
 {
-  "input_dir": "你的输入路径",
-  "output_dir": "你的输出路径",
+  "input_dir": "/Volumes/ExtendDisk/小米照片HEIF",
+  "output_dir": "/Volumes/ExtendDisk/HEIF转换",
 
   "output_format": "heif",
 
@@ -12,5 +12,7 @@
   "recursive": false,
   "keep_subdir_structure": false,
 
-  "overwrite": true
+  "overwrite": true,
+  "sync_file_mtime": true,
+  "prefer_filename_time": true
 }

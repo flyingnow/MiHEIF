@@ -1,11 +1,27 @@
 import json
 import os
+import re
+from datetime import datetime
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import numpy as np
 from PIL import Image
 import pillow_heif
+
+
+# =========================================================
+# 0. 注册 pillow_heif 到 Pillow
+# =========================================================
+_HEIF_REGISTERED = False
+
+
+def ensure_heif_registered():
+    global _HEIF_REGISTERED
+    if not _HEIF_REGISTERED:
+        pillow_heif.register_heif_opener()
+        _HEIF_REGISTERED = True
+
 
 # =========================================================
 # 1. 核心映射：错误读取的三通道 -> 正确 RGB
@@ -15,8 +31,10 @@ import pillow_heif
 #    Cr = R
 #    使用 full-range YCbCr -> RGB
 # =========================================================
-
 def recover_rgb_from_misread_heif(arr: np.ndarray) -> np.ndarray:
+    if arr.ndim != 3 or arr.shape[2] < 3:
+        raise ValueError(f"输入图像通道数异常，当前 shape = {arr.shape}")
+
     arr = arr.astype(np.float32, copy=False)
 
     Y = arr[:, :, 1]   # G
@@ -32,61 +50,140 @@ def recover_rgb_from_misread_heif(arr: np.ndarray) -> np.ndarray:
 
 
 # =========================================================
-# 2. 读取 HEIF/HEIC
+# 2. 读取 HEIF/HEIC，并提取元数据
+#    只提取稳定且明确需要保留的元数据
 # =========================================================
-def read_heif_as_array(path: Path) -> np.ndarray:
-    heif_file = pillow_heif.open_heif(str(path), convert_hdr_to_8bit=True)
-    img = heif_file.to_pillow().convert("RGB")
-    return np.asarray(img)
+def read_heif_image_and_metadata(path: Path):
+    ensure_heif_registered()
+
+    with Image.open(str(path)) as img:
+        metadata = {
+            "exif": img.info.get("exif"),
+            "xmp": img.info.get("xmp"),
+            "icc_profile": img.info.get("icc_profile"),
+        }
+
+        rgb_img = img.convert("RGB")
+        arr = np.asarray(rgb_img)
+
+    return arr, metadata
 
 
 # =========================================================
-# 3. 保存输出
+# 3. 保存输出，同时写回元数据
 # =========================================================
 def save_image(
     rgb: np.ndarray,
     output_path: Path,
     output_format: str,
+    metadata: dict | None = None,
     heif_quality: int = -1,
     png_compress_level: int = 9,
 ):
-    img = Image.fromarray(rgb)
+    ensure_heif_registered()
 
+    img = Image.fromarray(rgb)
     fmt = output_format.lower()
+    metadata = metadata or {}
+
+    save_kwargs = {}
+
+    if metadata.get("exif") is not None:
+        save_kwargs["exif"] = metadata["exif"]
+    if metadata.get("xmp") is not None:
+        save_kwargs["xmp"] = metadata["xmp"]
+    if metadata.get("icc_profile") is not None:
+        save_kwargs["icc_profile"] = metadata["icc_profile"]
 
     if fmt in ("heif", "heic"):
+        if "HEIF" not in Image.SAVE:
+            raise RuntimeError(
+                "当前环境未注册 HEIF 保存器。"
+                "请确认已安装 pillow-heif，并已调用 pillow_heif.register_heif_opener()。"
+            )
+
         img.save(
             str(output_path),
             format="HEIF",
-            quality=heif_quality,
+            quality=heif_quality,   # -1 表示无损
             chroma="444",
             matrix_coefficients=0,
+            **save_kwargs,
         )
+
     elif fmt == "png":
         img.save(
             str(output_path),
             format="PNG",
             optimize=True,
             compress_level=png_compress_level,
+            **save_kwargs,
         )
     else:
         raise ValueError(f"不支持的输出格式: {output_format}")
 
 
 # =========================================================
-# 4. 收集输入文件
+# 4. 从文件名解析时间
+#    支持:
+#    IMG_20231224_200514.heif
+#    IMG_20231230_194101.heif
+#    也兼容文件名中只要包含 YYYYMMDD_HHMMSS 即可
+# =========================================================
+def parse_datetime_from_filename(path: Path):
+    name = path.stem
+
+    # 匹配 20231224_200514
+    m = re.search(r"(\d{8})_(\d{6})", name)
+    if not m:
+        return None
+
+    date_part = m.group(1)
+    time_part = m.group(2)
+
+    try:
+        dt = datetime.strptime(date_part + time_part, "%Y%m%d%H%M%S")
+        return dt
+    except ValueError:
+        return None
+
+
+# =========================================================
+# 5. 设置输出文件时间
+#    优先使用文件名中的时间；
+#    若解析失败，则回退为原文件时间
+# =========================================================
+def sync_output_file_times(src: Path, dst: Path, prefer_filename_time: bool = True):
+    dt = None
+
+    if prefer_filename_time:
+        dt = parse_datetime_from_filename(src)
+
+    if dt is not None:
+        ts = dt.timestamp()
+        os.utime(dst, (ts, ts))
+        return "文件名时间"
+
+    stat = src.stat()
+    os.utime(dst, (stat.st_atime, stat.st_mtime))
+    return "原文件时间"
+
+
+# =========================================================
+# 6. 收集输入文件
 # =========================================================
 def collect_input_files(input_dir: Path, recursive: bool):
-    exts = {".heic", ".heif", ".HEIC", ".HEIF"}
+    exts = {".heic", ".heif"}
     if recursive:
-        files = [p for p in input_dir.rglob("*") if p.is_file() and p.suffix in exts]
+        files = [p for p in input_dir.rglob("*") if p.is_file() and p.suffix.lower() in exts]
     else:
-        files = [p for p in input_dir.iterdir() if p.is_file() and p.suffix in exts]
+        files = [p for p in input_dir.iterdir() if p.is_file() and p.suffix.lower() in exts]
     return sorted(files)
 
 
 # =========================================================
-# 5. 构造输出路径
+# 7. 构造输出路径
+#    HEIF 输出后缀强制大写 .HEIF
 # =========================================================
 def build_output_path(
     input_path: Path,
@@ -109,7 +206,7 @@ def build_output_path(
 
 
 # =========================================================
-# 6. 单文件处理
+# 8. 单文件处理
 # =========================================================
 def process_one_file(task):
     (
@@ -121,6 +218,8 @@ def process_one_file(task):
         png_compress_level,
         keep_subdir_structure,
         overwrite,
+        sync_file_mtime,
+        prefer_filename_time,
     ) = task
 
     input_path = Path(input_path_str)
@@ -128,6 +227,8 @@ def process_one_file(task):
     output_root = Path(output_root_str)
 
     try:
+        ensure_heif_registered()
+
         output_path = build_output_path(
             input_path=input_path,
             input_root=input_root,
@@ -139,25 +240,34 @@ def process_one_file(task):
         if output_path.exists() and not overwrite:
             return True, str(input_path), str(output_path), "跳过（已存在）"
 
-        arr = read_heif_as_array(input_path)
+        arr, metadata = read_heif_image_and_metadata(input_path)
         rgb = recover_rgb_from_misread_heif(arr)
 
         save_image(
             rgb=rgb,
             output_path=output_path,
             output_format=output_format,
+            metadata=metadata,
             heif_quality=heif_quality,
             png_compress_level=png_compress_level,
         )
 
-        return True, str(input_path), str(output_path), "完成"
+        time_source = "未同步"
+        if sync_file_mtime:
+            time_source = sync_output_file_times(
+                src=input_path,
+                dst=output_path,
+                prefer_filename_time=prefer_filename_time,
+            )
+
+        return True, str(input_path), str(output_path), f"完成（时间来源: {time_source}）"
 
     except Exception as e:
-        return False, str(input_path), "", str(e)
+        return False, str(input_path), "", f"{type(e).__name__}: {e}"
 
 
 # =========================================================
-# 7. 读取配置文件
+# 9. 读取配置文件
 # =========================================================
 def load_config(config_path="config.json"):
     config_path = Path(config_path)
@@ -171,21 +281,30 @@ def load_config(config_path="config.json"):
 
 
 # =========================================================
-# 8. 主流程
+# 10. 主流程
 # =========================================================
 def main():
+    ensure_heif_registered()
+
     cfg = load_config("config.json")
 
     input_dir = Path(cfg["input_dir"])
     output_dir = Path(cfg["output_dir"])
 
-    output_format = cfg.get("output_format", "heif")
+    output_format = cfg.get("output_format", "heif").lower()
     workers = cfg.get("workers", 0)
     heif_quality = cfg.get("heif_quality", -1)
     png_compress_level = cfg.get("png_compress_level", 9)
     recursive = cfg.get("recursive", False)
     keep_subdir_structure = cfg.get("keep_subdir_structure", False)
     overwrite = cfg.get("overwrite", True)
+    sync_file_mtime = cfg.get("sync_file_mtime", True)
+
+    # 新增：是否优先使用文件名中的时间
+    prefer_filename_time = cfg.get("prefer_filename_time", True)
+
+    if output_format not in ("heif", "heic", "png"):
+        raise ValueError("output_format 仅支持: heif / heic / png")
 
     if not input_dir.exists():
         raise FileNotFoundError(f"输入目录不存在: {input_dir}")
@@ -210,6 +329,8 @@ def main():
             png_compress_level,
             keep_subdir_structure,
             overwrite,
+            sync_file_mtime,
+            prefer_filename_time,
         )
         for f in files
     ]
@@ -223,6 +344,8 @@ def main():
     print("递归处理:", recursive)
     print("保持子目录结构:", keep_subdir_structure)
     print("覆盖输出:", overwrite)
+    print("同步文件修改时间:", sync_file_mtime)
+    print("优先使用文件名时间:", prefer_filename_time)
     print("==============================")
 
     ok_count = 0
@@ -241,6 +364,7 @@ def main():
                 else:
                     ok_count += 1
                     print(f"[成功] {in_file} -> {out_file}")
+                    print(f"       {msg}")
             else:
                 fail_count += 1
                 print(f"[失败] {in_file}")
